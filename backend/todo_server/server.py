@@ -1,131 +1,50 @@
-from contextlib import asynccontextmanager
-from datetime import datetime
-import os
-import sys
-
-from bson import ObjectId
-from fastapi import FastAPI, status
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel
-import uvicorn
+from bson import ObjectId
+from typing import List
 
-from dal import ToDoDAL, ListSummary, ToDoList
+app = FastAPI()
 
-COLLECTION_NAME = "todo_lists"
-MONGODB_URI = os.environ["MONGODB_URI"]
-DEBUG = os.environ.get("DEBUG", "").strip().lower() in {"1", "true", "on", "yes"}
+client = AsyncIOMotorClient("mongodb://localhost:27017")
+db = client.todo_db
+collection = db.todo_collection
 
+class TodoItem(BaseModel):
+    id: str = Field(default_factory=lambda: str(ObjectId()), alias="_id")
+    title: str
+    description: str
+    completed: bool = False
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup:
-    client = AsyncIOMotorClient(MONGODB_URI)
-    database = client.get_default_database()
+@app.post("/todos/", response_model=TodoItem)
+async def create_todo_item(todo: TodoItem):
+    result = await collection.insert_one(todo.dict(by_alias=True))
+    if result.inserted_id:
+        return todo
+    raise HTTPException(status_code=400, detail="Failed to create todo item")
 
-    # Ensure the database is available:
-    pong = await database.command("ping")
-    if int(pong["ok"]) != 1:
-        raise Exception("Cluster connection is not okay!")
+@app.get("/todos/", response_model=List[TodoItem])
+async def get_todo_items():
+    todos = await collection.find().to_list(1000)
+    return todos
 
-    todo_lists = database.get_collection(COLLECTION_NAME)
-    app.todo_dal = ToDoDAL(todo_lists)
+@app.get("/todos/{todo_id}", response_model=TodoItem)
+async def get_todo_item(todo_id: str):
+    todo = await collection.find_one({"_id": ObjectId(todo_id)})
+    if todo:
+        return todo
+    raise HTTPException(status_code=404, detail="Todo item not found")
 
-    # Yield back to FastAPI Application:
-    yield
+@app.put("/todos/{todo_id}", response_model=TodoItem)
+async def update_todo_item(todo_id: str, todo: TodoItem):
+    result = await collection.update_one({"_id": ObjectId(todo_id)}, {"$set": todo.dict(by_alias=True)})
+    if result.modified_count:
+        return todo
+    raise HTTPException(status_code=400, detail="Failed to update todo item")
 
-    # Shutdown:
-    client.close()
-
-
-app = FastAPI(lifespan=lifespan, debug=DEBUG)
-
-
-@app.get("/api/lists")
-async def get_all_lists() -> list[ListSummary]:
-    return [i async for i in app.todo_dal.list_todo_lists()]
-
-
-class NewList(BaseModel):
-    name: str
-
-
-class NewListResponse(BaseModel):
-    id: str
-    name: str
-
-
-@app.post("/api/lists", status_code=status.HTTP_201_CREATED)
-async def create_todo_list(new_list: NewList) -> NewListResponse:
-    return NewListResponse(
-        id=await app.todo_dal.create_todo_list(new_list.name),
-        name=new_list.name,
-    )
-
-
-@app.get("/api/lists/{list_id}")
-async def get_list(list_id: str) -> ToDoList:
-    """Get a single to-do list"""
-    return await app.todo_dal.get_todo_list(list_id)
-
-
-@app.delete("/api/lists/{list_id}")
-async def delete_list(list_id: str) -> bool:
-    return await app.todo_dal.delete_todo_list(list_id)
-
-
-class NewItem(BaseModel):
-    label: str
-
-
-class NewItemResponse(BaseModel):
-    id: str
-    label: str
-
-
-@app.post(
-    "/api/lists/{list_id}/items/",
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_item(list_id: str, new_item: NewItem) -> ToDoList:
-    return await app.todo_dal.create_item(list_id, new_item.label)
-
-
-@app.delete("/api/lists/{list_id}/items/{item_id}")
-async def delete_item(list_id: str, item_id: str) -> ToDoList:
-    return await app.todo_dal.delete_item(list_id, item_id)
-
-
-class ToDoItemUpdate(BaseModel):
-    item_id: str
-    checked_state: bool
-
-
-@app.patch("/api/lists/{list_id}/checked_state")
-async def set_checked_state(list_id: str, update: ToDoItemUpdate) -> ToDoList:
-    return await app.todo_dal.set_checked_state(
-        list_id, update.item_id, update.checked_state
-    )
-
-
-class DummyResponse(BaseModel):
-    id: str
-    when: datetime
-
-
-@app.get("/api/dummy")
-async def get_dummy() -> DummyResponse:
-    return DummyResponse(
-        id=str(ObjectId()),
-        when=datetime.now(),
-    )
-
-
-def main(argv=sys.argv[1:]):
-    try:
-        uvicorn.run("server:app", host="0.0.0.0", port=3001, reload=DEBUG)
-    except KeyboardInterrupt:
-        pass
-
-
-if __name__ == "__main__":
-    main()
+@app.delete("/todos/{todo_id}")
+async def delete_todo_item(todo_id: str):
+    result = await collection.delete_one({"_id": ObjectId(todo_id)})
+    if result.deleted_count:
+        return {"message": "Todo item deleted"}
+    raise HTTPException(status_code=404, detail="Todo item not found")
